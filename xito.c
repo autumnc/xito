@@ -208,6 +208,8 @@ static int            scroll_y = 0;
 static int            composing = 0;
 static char           preedit_buf[MAX_PREEDIT] = "";
 static int            preedit_caret = 0;
+static int            use_preedit_position = 0;  /* using XIMPreeditPosition style */
+static XFontSet       preedit_fontset = NULL;     /* fontset for XIM PreeditPosition */
 
 /* ======================== UTF-8 Utilities ======================== */
 
@@ -541,6 +543,108 @@ static void sel_update_shift(TextBuf *tb, size_t new_pos)
     }
     if (tb->sel_start == tb->sel_end)
         tb->has_sel = 0;
+}
+
+/* ======================== Spot Location (Cursor Following) ======================== */
+
+/* Forward declaration — defined later after Pango rendering init */
+static int get_line_height(void);
+
+/*
+ * Update the XNSpotLocation attribute of the input context so that the
+ * input method (e.g. Yong, ibus, fcitx) knows where the text cursor is
+ * on screen and can position its candidate window accordingly.
+ *
+ * This is the key mechanism for "cursor following" (光标跟随):
+ *   - For XIM: the IM reads XNSpotLocation from preedit attributes,
+ *     translates the window-local coordinates to root coordinates via
+ *     XTranslateCoordinates, then moves its candidate window there.
+ *   - For IBus-XIM bridge: the bridge converts XNSpotLocation to
+ *     SetCursorLocation D-Bus calls, which reach the IBus engine's
+ *     set_cursor_location callback.
+ *
+ * Must be called after every cursor movement and after draw().
+ */
+static void update_spot_location(void)
+{
+    if (!xic || !dpy || !win || !pango_layout)
+        return;
+
+    /* Ensure the layout has the current text so cursor positions are accurate */
+    pango_layout_set_text(pango_layout, editor.data, (int)editor.len);
+    pango_layout_set_width(pango_layout, (config.width - 2 * PAD) * PANGO_SCALE);
+
+    PangoRectangle strong_pos, weak_pos;
+    pango_layout_get_cursor_pos(pango_layout, (int)editor.cursor,
+                                 &strong_pos, &weak_pos);
+
+    /* Cursor position in window-local coordinates (accounting for scroll) */
+    int cx = PAD + strong_pos.x / PANGO_SCALE;
+    int cy = PAD + strong_pos.y / PANGO_SCALE - scroll_y;
+    int lh = get_line_height();
+    if (lh < 10) lh = 18;
+
+    /*
+     * XNSpotLocation coordinates are relative to the XNClientWindow.
+     * The IM will translate them to root (screen) coordinates via
+     * XTranslateCoordinates to position its candidate window.
+     *
+     * We set the spot just below the cursor line, which is the natural
+     * position for the candidate window to appear.
+     *
+     * Yong IM's store_ic_values() processes XNSpotLocation by calling
+     * XTranslateCoordinates(dpy, focus_window, root, pt->x, pt->y, ...)
+     * to convert window-local coords to screen coords, then calls
+     * YongMoveInput() to move the candidate window.
+     *
+     * For IBus path, ibus_yong_engine_set_cursor_location() receives
+     * (x, y, w, h) in screen coordinates and sets client->track=1,
+     * then calls YongMoveInput(x+w, y+h).
+     */
+    XPoint spot;
+    spot.x = cx;
+    spot.y = cy + lh;
+
+    /*
+     * Also update XNArea so the IM knows the preedit area boundaries.
+     * This is critical for PreeditPosition style where the IM draws
+     * the preedit text in a floating window, and also helps some
+     * IM bridges (like IBus-XIM) properly forward cursor location.
+     *
+     * Yong's store_ic_values() does not explicitly read XNArea for
+     * cursor positioning, but the IMdkit/Xi18n layer uses XNArea
+     * internally to validate the spot location is within bounds.
+     * Without updating XNArea, some XIM implementations may ignore
+     * the XNSpotLocation if it falls outside the stale XNArea.
+     */
+    XRectangle area;
+    area.x = PAD;
+    area.y = PAD;
+    area.width = config.width - 2 * PAD;
+    area.height = config.height - 2 * PAD;
+
+    XVaNestedList preedit_attr = XVaCreateNestedList(0,
+        XNSpotLocation, &spot,
+        XNArea, &area,
+        NULL);
+
+    XSetICValues(xic, XNPreeditAttributes, preedit_attr, NULL);
+    XFree(preedit_attr);
+
+    /*
+     * Flush the XSetICValues request immediately so the IM server
+     * receives the spot location update before the next key event.
+     * Without this, the XSetICValues may be buffered in the Xlib
+     * output buffer and not sent until the next XFlush/XSync, which
+     * could be too late — the IM would process the key event using
+     * stale cursor position data.
+     *
+     * This is especially important for Yong IM's XIM path where
+     * set_cursor_location_default() is called on each KeyPress
+     * and relies on client->track being set by store_ic_values()
+     * to skip the default (bottom-of-window) positioning.
+     */
+    XFlush(dpy);
 }
 
 /* ======================== Markdown Parser ======================== */
@@ -936,25 +1040,36 @@ static void init_input_method(void)
     }
 
     /*
-     * Select the best XIM style.
-     *
-     * Modern IM frameworks (ibus, fcitx via XIM bridge) often ONLY support
-     * XIMPreeditNothing — meaning the IM server manages its own preedit UI
-     * (floating candidate window, composition bar, etc.) and the application
-     * only receives the final committed text via Xutf8LookupString.
+     * Select the best XIM style for cursor following (光标跟随).
      *
      * Priority order:
-     *   1. PreeditCallbacks + StatusNothing  (ideal: app draws preedit inline)
-     *   2. PreeditCallbacks + anything else  (app draws preedit inline)
-     *   3. PreeditNothing + StatusNothing    (IM manages its own preedit UI)
-     *   4. PreeditNothing + anything else    (IM manages its own preedit UI)
-     *   5. Any other style with preedit support
+     *   1. PreeditPosition + StatusNothing  (best: IM draws preedit at cursor,
+     *                                        native cursor following via XNSpotLocation)
+     *   2. PreeditPosition + anything else  (native cursor following)
+     *   3. PreeditCallbacks + StatusNothing  (app draws preedit inline,
+     *                                        cursor following via XNSpotLocation)
+     *   4. PreeditCallbacks + anything else  (inline preedit + cursor following)
+     *   5. PreeditNothing + StatusNothing    (IM manages its own UI)
+     *   6. PreeditNothing + anything else    (IM manages its own UI)
      *
-     * We skip PreeditPosition/Area because we can't handle geometry callbacks.
+     * PreeditPosition is preferred because IMs like Yong natively support it:
+     *   - Yong's store_ic_values() processes XNSpotLocation from this style
+     *   - The IM draws preedit text in a floating window at the cursor position
+     *   - The candidate window follows the cursor automatically
+     *
+     * PreeditCallbacks is the second choice: it provides inline preedit drawing
+     * by the application, while XNSpotLocation tells the IM where the cursor is
+     * so the candidate window can follow.  Yong's store_ic_values() processes
+     * XNSpotLocation regardless of the input style, so cursor following works
+     * even with PreeditCallbacks.
+     *
+     * We skip PreeditArea because we can't handle geometry callbacks.
      */
+    XIMStyle best_position_style = 0;    /* best style WITH PreeditPosition */
+    XIMStyle fallback_position_style = 0;
     XIMStyle best_callbacks_style = 0;   /* best style WITH PreeditCallbacks */
     XIMStyle fallback_callbacks_style = 0;
-    XIMStyle best_nothing_style = 0;     /* best style WITHOUT PreeditCallbacks */
+    XIMStyle best_nothing_style = 0;     /* best style WITH PreeditNothing */
     XIMStyle fallback_nothing_style = 0;
 
     fprintf(stderr, "editor: IM supports %d styles:\n", imstyles->count_styles);
@@ -975,11 +1090,18 @@ static void init_input_method(void)
                 (s & XIMStatusArea) ? "Area" :
                 (s & XIMStatusNone) ? "None" : "Unknown");
 
-        /* Skip styles with PreeditPosition/Area (we can't handle these) */
-        if (preedit == XIMPreeditPosition || preedit == XIMPreeditArea)
+        /* Skip PreeditArea — we can't handle it */
+        if (preedit == XIMPreeditArea)
             continue;
 
-        if (preedit == XIMPreeditCallbacks) {
+        if (preedit == XIMPreeditPosition) {
+            if (fallback_position_style == 0)
+                fallback_position_style = s;
+            /* Prefer StatusNothing */
+            if (s & XIMStatusNothing) {
+                best_position_style = s;
+            }
+        } else if (preedit == XIMPreeditCallbacks) {
             if (fallback_callbacks_style == 0)
                 fallback_callbacks_style = s;
             /* Prefer StatusNothing */
@@ -994,7 +1116,7 @@ static void init_input_method(void)
                 best_nothing_style = s;
             }
         } else {
-            /* Unknown preedit type but not Position/Area — try as fallback */
+            /* Unknown preedit type but not Area — try as fallback */
             if (fallback_nothing_style == 0)
                 fallback_nothing_style = s;
         }
@@ -1003,79 +1125,207 @@ static void init_input_method(void)
     XFree(imstyles);
     imstyles = NULL;
 
-    /* Choose: prefer Callbacks (inline preedit) over Nothing (IM-managed preedit) */
-    XIMStyle chosen_style = 0;
-    int use_preedit_callbacks = 0;
+    /*
+     * Create an XFontSet for PreeditPosition style.
+     *
+     * IMdkit-based IM servers (like Yong) REQUIRE XNFontSet in the preedit
+     * attributes when using XIMPreeditPosition style.  Without it, XCreateIC
+     * returns NULL because the IM cannot draw preedit text in its floating
+     * window without knowing which font to use.
+     *
+     * Since our editor uses Pango/Cairo for rendering (not X core fonts),
+     * we create a generic XFontSet that can render CJK characters.  The
+     * font quality of the IM's preedit window is the IM's responsibility;
+     * we just need to provide a working font set so the IM can create the IC.
+     */
+    char **missing_list = NULL;
+    int missing_count = 0;
+    char *def_string = NULL;
 
-    if (best_callbacks_style) {
-        chosen_style = best_callbacks_style;
-        use_preedit_callbacks = 1;
-    } else if (fallback_callbacks_style) {
-        chosen_style = fallback_callbacks_style;
-        use_preedit_callbacks = 1;
-    } else if (best_nothing_style) {
-        chosen_style = best_nothing_style;
-        use_preedit_callbacks = 0;
-    } else if (fallback_nothing_style) {
-        chosen_style = fallback_nothing_style;
-        use_preedit_callbacks = 0;
+    preedit_fontset = XCreateFontSet(dpy,
+        "-*-*-*-*-*-*-*-*-*-*-*-*-*,*",
+        &missing_list, &missing_count, &def_string);
+    if (missing_list) {
+        XFreeStringList(missing_list);
+        missing_list = NULL;
+    }
+    if (!preedit_fontset) {
+        fprintf(stderr, "editor: warning: could not create font set, "
+                "PreeditPosition style will not be available\n");
     }
 
-    if (chosen_style == 0) {
+    /*
+     * Build ordered list of styles to try (with fallback).
+     *
+     * Each attempt specifies: the XIM style value, whether it uses
+     * PreeditPosition, and whether it uses PreeditCallbacks.
+     */
+    typedef struct {
+        XIMStyle style;
+        int use_position;
+        int use_callbacks;
+    } StyleAttempt;
+
+    StyleAttempt attempts[8];
+    int num_attempts = 0;
+
+    if (best_position_style && preedit_fontset) {
+        attempts[num_attempts++] = (StyleAttempt){best_position_style, 1, 0};
+    }
+    if (fallback_position_style && fallback_position_style != best_position_style
+        && preedit_fontset) {
+        attempts[num_attempts++] = (StyleAttempt){fallback_position_style, 1, 0};
+    }
+    if (best_callbacks_style) {
+        attempts[num_attempts++] = (StyleAttempt){best_callbacks_style, 0, 1};
+    }
+    if (fallback_callbacks_style && fallback_callbacks_style != best_callbacks_style) {
+        attempts[num_attempts++] = (StyleAttempt){fallback_callbacks_style, 0, 1};
+    }
+    if (best_nothing_style) {
+        attempts[num_attempts++] = (StyleAttempt){best_nothing_style, 0, 0};
+    }
+    if (fallback_nothing_style && fallback_nothing_style != best_nothing_style) {
+        attempts[num_attempts++] = (StyleAttempt){fallback_nothing_style, 0, 0};
+    }
+
+    if (num_attempts == 0) {
         fprintf(stderr, "editor: warning: no compatible XIM style found\n");
         XCloseIM(xim);
         xim = NULL;
+        if (preedit_fontset) { XFreeFontSet(dpy, preedit_fontset); preedit_fontset = NULL; }
         return;
     }
 
-    fprintf(stderr, "editor: input method opened, style=0x%lx, preedit=%s\n",
-            (unsigned long)chosen_style,
-            use_preedit_callbacks ? "Callbacks (inline)" : "Nothing (IM-managed)");
+    /*
+     * Prepare spot location and area for cursor following.
+     *
+     * XNSpotLocation tells the IM where the text cursor is (in window-local
+     * coordinates).  The IM translates this to screen coordinates via
+     * XTranslateCoordinates and positions its candidate window there.
+     *
+     * XNArea defines the preedit area boundaries.  For PreeditPosition style,
+     * the IM uses this to decide where to place the floating preedit window.
+     */
+    XPoint spot;
+    spot.x = PAD;
+    spot.y = PAD + get_line_height();
+
+    XRectangle area;
+    area.x = PAD;
+    area.y = PAD;
+    area.width = config.width - 2 * PAD;
+    area.height = config.height - 2 * PAD;
+
+    unsigned long fg_pixel = color_to_xpixel(config.fg);
+    unsigned long bg_pixel = color_to_xpixel(config.bg);
 
     /*
-     * Create the input context.
+     * Try creating the input context with each style in priority order.
+     * If XCreateIC fails with one style, fall back to the next best.
      *
-     * - With PreeditCallbacks: register our preedit callback functions so the app
-     *   can draw the composing text inline (the reference inputmethod.c style).
-     *
-     * - With PreeditNothing: do NOT pass PreeditAttributes. The IM server will
-     *   manage its own candidate/composition window. Committed text arrives via
-     *   Xutf8LookupString returning XBufferOverflow or XLookupChars.
+     * Common failure reasons:
+     *   - PreeditPosition without XNFontSet → fixed by creating fontset above
+     *   - IM server rejects the style combination
+     *   - Missing required attributes for the given style
      */
-    if (use_preedit_callbacks) {
-        XICCallback start_cb = { NULL, (XICProc)preedit_start_cb };
-        XICCallback done_cb  = { NULL, (XICProc)preedit_done_cb };
-        XICCallback draw_cb  = { NULL, (XICProc)preedit_draw_cb };
-        XICCallback caret_cb = { NULL, (XICProc)preedit_caret_cb };
+    use_preedit_position = 0;
 
-        XVaNestedList preedit_attr = XVaCreateNestedList(0,
-            XNPreeditStartCallback, &start_cb,
-            XNPreeditDoneCallback,  &done_cb,
-            XNPreeditDrawCallback,  &draw_cb,
-            XNPreeditCaretCallback, &caret_cb,
-            NULL);
+    for (int i = 0; i < num_attempts; i++) {
+        XIMStyle style = attempts[i].style;
 
-        xic = XCreateIC(xim,
-            XNInputStyle,       chosen_style,
-            XNPreeditAttributes, preedit_attr,
-            XNClientWindow,     win,
-            XNFocusWindow,      win,
-            NULL);
+        if (attempts[i].use_position) {
+            /*
+             * PreeditPosition: the IM draws preedit text in a floating
+             * window at the spot location.  We MUST provide XNFontSet,
+             * XNForeground, and XNBackground so the IM knows what font
+             * and colors to use for drawing the preedit text.
+             */
+            XVaNestedList preedit_attr = XVaCreateNestedList(0,
+                XNSpotLocation, &spot,
+                XNArea, &area,
+                XNFontSet, preedit_fontset,
+                XNForeground, fg_pixel,
+                XNBackground, bg_pixel,
+                NULL);
 
-        XFree(preedit_attr);
-    } else {
-        /* PreeditNothing: no preedit callbacks, IM manages its own UI */
-        xic = XCreateIC(xim,
-            XNInputStyle,   chosen_style,
-            XNClientWindow, win,
-            XNFocusWindow,  win,
-            NULL);
+            xic = XCreateIC(xim,
+                XNInputStyle,       style,
+                XNPreeditAttributes, preedit_attr,
+                XNClientWindow,     win,
+                XNFocusWindow,      win,
+                NULL);
+
+            XFree(preedit_attr);
+        } else if (attempts[i].use_callbacks) {
+            /*
+             * PreeditCallbacks: the app draws preedit text inline.  We also
+             * provide XNSpotLocation so the IM can position its candidate
+             * window at the cursor location (cursor following).
+             */
+            XICCallback start_cb = { NULL, (XICProc)preedit_start_cb };
+            XICCallback done_cb  = { NULL, (XICProc)preedit_done_cb };
+            XICCallback draw_cb  = { NULL, (XICProc)preedit_draw_cb };
+            XICCallback caret_cb = { NULL, (XICProc)preedit_caret_cb };
+
+            XVaNestedList preedit_attr = XVaCreateNestedList(0,
+                XNPreeditStartCallback, &start_cb,
+                XNPreeditDoneCallback,  &done_cb,
+                XNPreeditDrawCallback,  &draw_cb,
+                XNPreeditCaretCallback, &caret_cb,
+                XNSpotLocation, &spot,
+                XNArea, &area,
+                NULL);
+
+            xic = XCreateIC(xim,
+                XNInputStyle,       style,
+                XNPreeditAttributes, preedit_attr,
+                XNClientWindow,     win,
+                XNFocusWindow,      win,
+                NULL);
+
+            XFree(preedit_attr);
+        } else {
+            /*
+             * PreeditNothing: the IM manages its own UI entirely.  We still
+             * provide XNSpotLocation for cursor following — some IMs (like
+             * Yong) will process it and position the candidate window
+             * accordingly.
+             */
+            XVaNestedList preedit_attr = XVaCreateNestedList(0,
+                XNSpotLocation, &spot,
+                XNArea, &area,
+                NULL);
+
+            xic = XCreateIC(xim,
+                XNInputStyle,       style,
+                XNPreeditAttributes, preedit_attr,
+                XNClientWindow,     win,
+                XNFocusWindow,      win,
+                NULL);
+
+            XFree(preedit_attr);
+        }
+
+        if (xic) {
+            use_preedit_position = attempts[i].use_position;
+            fprintf(stderr, "editor: XIC created with style=0x%lx (%s)\n",
+                    (unsigned long)style,
+                    attempts[i].use_position ? "Position (cursor-following)" :
+                    attempts[i].use_callbacks ? "Callbacks (inline)" :
+                    "Nothing (IM-managed)");
+            break;
+        }
+
+        fprintf(stderr, "editor: XCreateIC failed with style=0x%lx, trying fallback...\n",
+                (unsigned long)style);
     }
 
     if (!xic) {
         fprintf(stderr, "editor: warning: could not create input context\n");
         XCloseIM(xim);
         xim = NULL;
+        if (preedit_fontset) { XFreeFontSet(dpy, preedit_fontset); preedit_fontset = NULL; }
         return;
     }
 
@@ -1345,7 +1595,13 @@ static void draw(void)
     }
 
     /* Draw cursor */
-    if (!composing) {
+    if (!composing || use_preedit_position) {
+        /*
+         * In PreeditPosition mode, the IM draws the preedit text in its own
+         * floating window, so we always show the editor's cursor even while
+         * composing.  In PreeditCallbacks mode, we hide the cursor during
+         * composition since the preedit text is drawn inline.
+         */
         PangoRectangle strong_pos, weak_pos;
         pango_layout_get_cursor_pos(pango_layout, (int)editor.cursor,
                                      &strong_pos, &weak_pos);
@@ -1431,6 +1687,14 @@ static void draw(void)
     /* Flush drawing */
     cairo_surface_flush(cairo_surface);
     XFlush(dpy);
+
+    /*
+     * Update XNSpotLocation after every redraw so the IM always knows
+     * the current cursor position for cursor following (光标跟随).
+     * This is critical for Yong IM and IBus to position their candidate
+     * windows near the text cursor.
+     */
+    update_spot_location();
 }
 
 /* ======================== Markdown Action Helpers ======================== */
@@ -2177,6 +2441,37 @@ int main(int argc, char **argv)
         XNextEvent(dpy, &event);
 
         /*
+         * Update the IM spot location BEFORE XFilterEvent processes the event.
+         *
+         * This is the KEY FIX for cursor following (光标跟随) with Yong IM.
+         *
+         * When a KeyPress arrives, XFilterEvent may consume it and forward it
+         * to the IM server. The IM server then processes the key and decides
+         * where to show the candidate window. If the spot location hasn't been
+         * updated yet, the IM uses stale position data and the candidate
+         * window appears at the wrong location.
+         *
+         * Specifically, in Yong IM's XIM path (ybus-xim.c), the
+         * YongForwardHandler() calls set_cursor_location_default() on each
+         * KeyPress to position the candidate window. This function checks
+         * client->track: if track==0 (no XNSpotLocation received yet), it
+         * falls back to positioning at the bottom of the window; if track==1,
+         * it skips the default positioning because store_ic_values() has
+         * already set the correct position from XNSpotLocation.
+         *
+         * By updating the spot location here (before XFilterEvent), we
+         * ensure that the XSetICValues with the new XNSpotLocation is
+         * flushed to the IM server BEFORE it processes the keystroke.
+         *
+         * For the IBus path (ybus-ibus.c), ibus_yong_engine_set_cursor_location()
+         * is called by the IBus framework when it receives the SetCursorLocation
+         * D-Bus signal, which is triggered by the IBus-XIM bridge processing
+         * the XNSpotLocation from XSetICValues.
+         */
+        if (xic && event.type == KeyPress)
+            update_spot_location();
+
+        /*
          * CRITICAL: Let the input method filter EVERY event before we process it.
          * Many IM implementations (ibus, fcitx) need to intercept FocusIn,
          * FocusOut, PropertyNotify, ClientMessage, etc. to manage their state.
@@ -2196,8 +2491,16 @@ int main(int argc, char **argv)
             break;
 
         case FocusIn:
-            if (xic)
+            if (xic) {
                 XSetICFocus(xic);
+                /*
+                 * Update spot location on focus gain. For override_redirect
+                 * windows, the IM may not know the window position until we
+                 * explicitly send it. This ensures cursor following works
+                 * immediately when the editor gains focus.
+                 */
+                update_spot_location();
+            }
             break;
 
         case FocusOut:
@@ -2213,6 +2516,11 @@ int main(int argc, char **argv)
                     config.width = nw;
                     config.height = nh;
                     rendering_resize(nw, nh);
+
+                    /* Update spot location (includes XNArea) on resize */
+                    if (xic)
+                        update_spot_location();
+
                     ensure_cursor_visible();
                     draw();
                 }
